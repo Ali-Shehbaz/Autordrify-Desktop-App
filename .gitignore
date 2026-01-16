@@ -1,0 +1,15 @@
+# Ignore the Virtual Environment
+venv/
+__pycache__/
+
+# Ignore Build Artifacts (The .exe stuff)
+build/
+dist/
+*.spec
+
+# Ignore Real Data
+customers.txt
+
+# Ignore IDE settings
+.vscode/
+.idea/

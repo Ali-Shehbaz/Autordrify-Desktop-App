@@ -32,16 +32,12 @@ DESTINATIONS = {
     "Ledger": r"G:/Previous Ledgers/01-ALL NEW DOWNLOADED LEDGERS"
 }
 
-# --- 2. REGEX PATTERNS ---
-so_pattern = re.compile(r"Sales Order No\.\s*(\d+)")
-so_customer_pattern = re.compile(r"Sales Order\n(.*?)\s+Sales Order No\.")
+# --- 2. REGEX PATTERNS (Helpers) ---
+# We keep these for date/customer extraction, but ID extraction is now manual
 so_date_pattern = re.compile(r"Date\s+(\d{2}/\d{2}/\d{4})")
 dc_pattern = re.compile(r"DC No\.\s*(\d+)")
-dc_customer_pattern = re.compile(r"Delivery Challan\n(.*?)\s+DC No\.")
 dc_date_pattern = re.compile(r"Date\s+(\d{2}/\d{2}/\d{4})")
 time_pattern = re.compile(r"_(\d{14})") 
-inv_pattern = re.compile(r"Inv No\.\s*([A-Z0-9]+)") 
-inv_customer_pattern = re.compile(r"Sales Tax Invoice\n(.*?)\s+Inv No\.")
 inv_date_pattern = re.compile(r"Date\s+(\d{2}/\d{2}/\d{4})")
 inv_dc_pattern = re.compile(r"DC No\.[ \t]*([^\n]*)")
 inv_po_pattern = re.compile(r"PO No\.[ \t]*([^\n]*)")
@@ -63,6 +59,7 @@ class CustomerManager(tk.Toplevel):
         tk.Label(self, text="Customer List", font=("Arial", 11, "bold")).pack(pady=5)
         self.listbox = tk.Listbox(self, selectmode=tk.EXTENDED, font=("Arial", 10))
         self.listbox.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        self.listbox.bind('<Control-a>', lambda e: self.listbox.select_set(0, tk.END))
         for c in self.customers: self.listbox.insert(tk.END, c)
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=10)
@@ -96,11 +93,15 @@ class AutordrifyApp:
         
         self.customers = self.load_customers()
         self.setup_ui()
-        self.register_system_features() # Auto-register on launch
+        self.register_system_features()
         
         threading.Thread(target=self.start_monitoring, daemon=True).start()
         threading.Thread(target=self.setup_tray, daemon=True).start()
         self.process_queue()
+
+    def sanitize(self, text):
+        # We allow dots (.) and dashes (-) but remove others
+        return re.sub(r'[\\/:*?"<>|;]', "-", str(text)).strip()
 
     def register_system_features(self):
         if not getattr(sys, 'frozen', False): return
@@ -165,6 +166,12 @@ class AutordrifyApp:
         self.tree.heading("Date", text="Date"); self.tree.column("Date", width=100)
         self.tree.heading("Path", text="Location"); self.tree.column("Path", width=250)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        self.tree.bind("<Control-a>", self.select_all_files)
+        
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Copy Cell Text", command=self.copy_text)
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=15)
         tk.Button(btn_frame, text="Manual Scan F:/", bg="#3498db", fg="white", width=15, command=self.manual_scan).pack(side=tk.LEFT, padx=5)
@@ -172,8 +179,48 @@ class AutordrifyApp:
         tk.Button(btn_frame, text="Move Selected", bg="#f39c12", fg="white", width=15, command=self.handle_move).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Manage Customers", bg="#7f8c8d", fg="white", width=18, command=self.open_customer_manager).pack(side=tk.LEFT, padx=5)
 
+    def select_all_files(self, event):
+        for item in self.tree.get_children(): self.tree.selection_add(item)
+        return "break"
+
+    def show_context_menu(self, event):
+        try:
+            item = self.tree.identify_row(event.y)
+            if item:
+                self.tree.selection_set(item)
+                self.context_menu.post(event.x_root, event.y_root)
+        except: pass
+
+    def copy_text(self):
+        selected = self.tree.selection()
+        if selected:
+            vals = self.tree.item(selected[0])['values']
+            text_to_copy = f"{vals[1]}"
+            self.root.clipboard_clear(); self.root.clipboard_append(text_to_copy); self.root.update()
+
     def open_customer_manager(self):
         CustomerManager(self.root, self.customers, self.save_customers)
+
+    def find_customer_fallback(self, text):
+        for cust in self.customers:
+            if cust.lower() in text.lower(): return cust
+        return "UNKNOWN_CUSTOMER"
+
+    # --- NEW LOGIC HELPER: Extract ID Multiline ---
+    def extract_id_multiline(self, lines, anchor_text):
+        """Finds anchor, takes rest of line. If next line isn't 'DC No.', appends it."""
+        for i, line in enumerate(lines):
+            if anchor_text in line:
+                # Get the part after the anchor
+                val = line.split(anchor_text, 1)[1].strip()
+                
+                # Check next line
+                if i + 1 < len(lines):
+                    next_line = lines[i+1].strip()
+                    if next_line and "DC No." not in next_line:
+                        val += next_line # Append it!
+                return val
+        return None
 
     def parse_pdf(self, file_path):
         filename = os.path.basename(file_path)
@@ -181,34 +228,73 @@ class AutordrifyApp:
             with pdfplumber.open(file_path) as pdf:
                 full_text = ""
                 for page in pdf.pages: full_text += page.extract_text() or "" + "\n"
+            
+            lines = full_text.split('\n')
+            
+            # --- DELIVERY CHALLAN ---
             if "GDNSO_" in filename:
-                dc_match, cust_match, date_match, ts_match = dc_pattern.search(full_text), dc_customer_pattern.search(full_text), dc_date_pattern.search(full_text), time_pattern.search(filename)
-                cust = cust_match.group(1).strip() if cust_match else (self.find_customer_fallback(full_text))
+                dc_match, date_match, ts_match = dc_pattern.search(full_text), dc_date_pattern.search(full_text), time_pattern.search(filename)
+                
+                # Manual Customer Find for consistency
+                cust = "UNKNOWN_CUSTOMER"
+                for line in lines:
+                    if "Delivery Challan" in line:
+                         # Customer usually on next line or same block
+                         pass 
+                cust = self.find_customer_fallback(full_text) # Fallback is reliable
+
                 date_raw = date_match.group(1).replace("/", "-") if date_match else "00-00-0000"
                 t_str = f"{ts_match.group(1)[8:10]}-{ts_match.group(1)[10:12]}-{ts_match.group(1)[12:14]}" if ts_match else "00-00-00"
-                return f"DC-{dc_match.group(1) if dc_match else 'UNK'}, {cust}, {date_raw}, {t_str}.pdf", "DC", date_raw
+                return f"DC-{dc_match.group(1) if dc_match else 'UNK'}, {self.sanitize(cust)}, {date_raw}, {t_str}.pdf", "DC", date_raw
+
+            # --- SALES ORDER ---
             elif "SO_" in filename:
-                so_match, cust_match, date_match = so_pattern.search(full_text), so_customer_pattern.search(full_text), so_date_pattern.search(full_text)
-                cust = cust_match.group(1).strip() if cust_match else (self.find_customer_fallback(full_text))
+                so_id = self.extract_id_multiline(lines, "Sales Order No.") or "UNK"
+                cust = self.sanitize(self.find_customer_fallback(full_text))
+                date_match = so_date_pattern.search(full_text)
                 date_raw = date_match.group(1).replace("/", "-") if date_match else "00-00-0000"
-                return f"{so_match.group(1) if so_match else 'UNK'}, {cust}, {date_raw}.pdf", "SO", date_raw
+                
+                # Sanitize ID to remove slashes etc
+                so_id = self.sanitize(so_id)
+                return f"{so_id}, {cust}, {date_raw}.pdf", "SO", date_raw
+
+            # --- INVOICE ---
             elif "SI_" in filename:
-                inv_match, cust_match, date_match, dc_match, po_match = inv_pattern.search(full_text), inv_customer_pattern.search(full_text), inv_date_pattern.search(full_text), inv_dc_pattern.search(full_text), inv_po_pattern.search(full_text)
-                cust = cust_match.group(1).strip() if cust_match else (self.find_customer_fallback(full_text))
+                inv_id = self.extract_id_multiline(lines, "Inv No.") or "UNK"
+                
+                # --- NEW LOGIC: Check Special Patterns ---
+                # Check if it starts with .MB, .CSH, .SO- or SO-
+                is_special_order = False
+                upper_id = inv_id.upper()
+                if upper_id.startswith(".MB") or upper_id.startswith(".CSH") or \
+                   upper_id.startswith(".SO-") or upper_id.startswith("SO-"):
+                    is_special_order = True
+                
+                cust = self.sanitize(self.find_customer_fallback(full_text))
+                date_match = inv_date_pattern.search(full_text)
                 date_raw = date_match.group(1).replace("/", "-") if date_match else "00-00-0000"
-                return f"{inv_match.group(1).strip() if inv_match else 'UNK'}, {cust}, D.C-{dc_match.group(1).strip() if dc_match else ''}, PO-{po_match.group(1).strip() if po_match else ''}, {date_raw}.pdf", "Invoice", date_raw
+                
+                dc_match = inv_dc_pattern.search(full_text)
+                po_match = inv_po_pattern.search(full_text)
+                
+                inv_id = self.sanitize(inv_id)
+                
+                # FILE TYPE DECISION:
+                # If special pattern -> Move as "SO"
+                # Else -> Move as "Invoice"
+                final_type = "SO" if is_special_order else "Invoice"
+                
+                return f"{inv_id}, {cust}, D.C-{dc_match.group(1).strip() if dc_match else ''}, PO-{po_match.group(1).strip() if po_match else ''}, {date_raw}.pdf", final_type, date_raw
+
+            # --- LEDGER ---
             elif "statement" in filename.lower():
                 cust_match, date_match = stmt_customer_pattern.search(full_text), stmt_date_range_pattern.search(full_text)
-                cust = cust_match.group(1).strip() if cust_match else (self.find_customer_fallback(full_text))
+                cust = self.sanitize(cust_match.group(1).strip() if cust_match else (self.find_customer_fallback(full_text)))
                 d_range = f"From {date_match.group(1).replace('/', '-')} to {date_match.group(2).replace('/', '-')}" if date_match else "all dates"
                 return f"Ledger, {cust}, {d_range}.pdf", "Ledger", (date_match.group(2).replace('/', '-') if date_match else "01-01-2000")
+            
             return None, "Other", None
         except: return None, "Error", None
-
-    def find_customer_fallback(self, text):
-        for cust in self.customers:
-            if cust.lower() in text.lower(): return cust
-        return "UNKNOWN_CUSTOMER"
 
     def start_monitoring(self):
         class Handler(FileSystemEventHandler):
@@ -245,10 +331,29 @@ class AutordrifyApp:
         for item_id in selected:
             v = self.tree.item(item_id)['values']
             if v[0] != "Pending": continue
-            new_path = os.path.join(os.path.dirname(v[4]), v[1])
+            
+            safe_new_name = self.sanitize(v[1])
+            if not safe_new_name.lower().endswith(".pdf"): safe_new_name += ".pdf"
+            
+            dir_path = os.path.dirname(v[4])
+            new_path = os.path.join(dir_path, safe_new_name)
+            
+            if os.path.exists(new_path):
+                choice = messagebox.askyesnocancel("File Exists", f"'{safe_new_name}' exists.\n\nYes: Replace\nNo: Keep Both\nCancel: Skip")
+                if choice is None: continue
+                elif choice is True: 
+                    try: os.remove(new_path)
+                    except: continue
+                else: 
+                    base, ext = os.path.splitext(safe_new_name)
+                    counter = 1
+                    while os.path.exists(os.path.join(dir_path, f"{base} ({counter}){ext}")): counter += 1
+                    new_path = os.path.join(dir_path, f"{base} ({counter}){ext}")
+                    safe_new_name = os.path.basename(new_path)
+
             try:
                 os.rename(v[4], new_path)
-                self.tree.item(item_id, values=("Renamed", v[1], v[2], v[3], new_path))
+                self.tree.item(item_id, values=("Renamed", safe_new_name, v[2], v[3], new_path))
             except Exception as e: messagebox.showerror("Error", str(e))
 
     def handle_move(self):
@@ -262,8 +367,16 @@ class AutordrifyApp:
                 dt = datetime.strptime(str(v[3]), "%d-%m-%Y")
                 sub = os.path.join(dest, f"{dt.strftime('%B')}-{dt.strftime('%Y')}") if v[2] in ["SO", "DC"] else (os.path.join(dest, f"{dt.strftime('%b').upper()}-{dt.strftime('%Y')}") if v[2] == "Invoice" else dest)
                 if not os.path.exists(sub): os.makedirs(sub)
-                shutil.move(v[4], os.path.join(sub, v[1]))
-                self.tree.item(item_id, values=("Moved", v[1], v[2], v[3], os.path.join(sub, v[1])))
+                
+                target_path = os.path.join(sub, v[1])
+                if os.path.exists(target_path):
+                     base, ext = os.path.splitext(v[1])
+                     counter = 1
+                     while os.path.exists(os.path.join(sub, f"{base} ({counter}){ext}")): counter += 1
+                     target_path = os.path.join(sub, f"{base} ({counter}){ext}")
+
+                shutil.move(v[4], target_path)
+                self.tree.item(item_id, values=("Moved", v[1], v[2], v[3], target_path))
             except Exception as e: messagebox.showerror("Error", str(e))
 
 if __name__ == "__main__":
@@ -278,4 +391,5 @@ if __name__ == "__main__":
     if os.path.exists(ICON_FILE):
         try: root.iconphoto(False, tk.PhotoImage(file=ICON_FILE))
         except: pass
+    app.register_system_features()
     root.mainloop()
